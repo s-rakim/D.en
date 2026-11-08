@@ -1,0 +1,90 @@
+# Raspberry Pi Tailscale exit node, tuned for throughput and latency.
+#
+#   docker compose up -d                          tuner only (Tailscale already on the host)
+#   docker compose --profile monitor up -d        + latency / speed logging
+#   docker compose --profile tailscale up -d      + run Tailscale itself in Docker
+#
+# See README.md for what each piece changes and why it needs the access it has.
+
+services:
+  tuner:
+    build: ./tuner
+    image: exitnode-tuner:local
+    container_name: exitnode-tuner
+    restart: unless-stopped
+    # Both of these are required. host networking puts the container in the
+    # Pi's own network namespace so sysctls, qdiscs, ethtool and iptables
+    # changes apply to the real interfaces. privileged gives it write access
+    # to /proc/sys, /sys and netfilter.
+    network_mode: host
+    privileged: true
+    volumes:
+      # Lets modprobe load tcp_bbr from the host's kernel modules.
+      - /lib/modules:/lib/modules:ro
+    environment:
+      WAN_IFACE: ${WAN_IFACE:-auto}
+      TS_IFACE: ${TS_IFACE:-tailscale0}
+      REAPPLY_INTERVAL: ${REAPPLY_INTERVAL:-300}
+      ENABLE_BBR: ${ENABLE_BBR:-true}
+      ENABLE_UDP_GRO_FORWARDING: ${ENABLE_UDP_GRO_FORWARDING:-true}
+      ENABLE_MSS_CLAMP: ${ENABLE_MSS_CLAMP:-true}
+      ENABLE_RPS: ${ENABLE_RPS:-true}
+      CPU_GOVERNOR: ${CPU_GOVERNOR:-performance}
+      DISABLE_WIFI_POWERSAVE: ${DISABLE_WIFI_POWERSAVE:-true}
+      TXQUEUELEN: ${TXQUEUELEN:-}
+      IPTABLES: ${IPTABLES:-auto}
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "2" }
+
+  tailscale:
+    profiles: ["tailscale"]
+    image: tailscale/tailscale:stable
+    container_name: exitnode-tailscale
+    hostname: ${TS_HOSTNAME:-pi-exit}
+    restart: unless-stopped
+    # Host networking so tailscale0 is a real interface on the Pi that the
+    # kernel can forward through, and so UDP 41641 is reachable for direct
+    # (non-relayed) connections.
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./tailscale-state:/var/lib/tailscale
+      - /lib/modules:/lib/modules:ro
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-pi-exit}
+      TS_STATE_DIR: /var/lib/tailscale
+      # Kernel TUN mode. Userspace networking is far slower; never use it for
+      # an exit node.
+      TS_USERSPACE: "false"
+      TS_ACCEPT_DNS: "false"
+      TS_EXTRA_ARGS: --advertise-exit-node ${TS_EXTRA_ARGS:-}
+      # Pin the WireGuard port so you can forward it on your router.
+      TS_TAILSCALED_EXTRA_ARGS: --port=${TS_PORT:-41641}
+    depends_on:
+      - tuner
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  monitor:
+    profiles: ["monitor"]
+    build: ./monitor
+    image: exitnode-monitor:local
+    container_name: exitnode-monitor
+    restart: unless-stopped
+    # Host networking so it measures the Pi's real uplink, not Docker's NAT.
+    # No extra privileges needed.
+    network_mode: host
+    volumes:
+      - ./data:/data
+    environment:
+      PING_TARGETS: ${PING_TARGETS:-1.1.1.1 8.8.8.8}
+      PING_INTERVAL: ${PING_INTERVAL:-60}
+      SPEEDTEST_INTERVAL: ${SPEEDTEST_INTERVAL:-21600}
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "2" }
